@@ -11,7 +11,9 @@ from __future__ import absolute_import
 
 from collections import deque
 
-from celery._state import get_current_worker_task, connect_on_app_finalize
+from celery import states
+from celery._state import connect_on_app_finalize, get_current_worker_task
+from celery.exceptions import ChordError
 from celery.utils import uuid
 from celery.utils.log import get_logger
 
@@ -296,8 +298,11 @@ def add_chain_task(app):
         def apply(self, args=(), kwargs={}, signature=maybe_signature,
                   **options):
             app = self.app
+            propagate = app.conf.CELERY_EAGER_PROPAGATES_EXCEPTIONS
             last, fargs = None, args  # fargs passed to first task only
             for task in kwargs['tasks']:
+                if not propagate and last and last.failed():
+                    break
                 res = signature(task, app=app).clone(fargs).apply(
                     last and (last.get(), ),
                 )
@@ -370,10 +375,50 @@ def add_chord_task(app):
             body_result.parent = parent
             return body_result
 
-        def apply(self, args=(), kwargs={}, propagate=True, **options):
-            body = kwargs['body']
-            res = super(Chord, self).apply(args, dict(kwargs, eager=True),
-                                           **options)
-            return maybe_signature(body, app=self.app).apply(
-                args=(res.get(propagate=propagate).get(), ))
+        def apply(self, args=(), kwargs={}, propagate=None, **options):
+            app = self.app
+            callback = maybe_signature(kwargs['body'], app=self.app)
+
+            # whether we should pass header errors to the callback
+            if propagate is None:
+                propagate = default_propagate
+
+            # whether we should propagate any task errors immediately
+            eager_propagate = app.conf.CELERY_EAGER_PROPAGATES_EXCEPTIONS
+
+            # apply the header, which should return a GroupResult
+            header_res = (
+                super(Chord, self)
+                .apply(args, dict(kwargs, eager=True), **options)
+            )
+            task_id = header_res.id
+
+            def chord_error_result(result, exc):
+                from celery.result import EagerResult
+                chord_exc = ChordError(
+                    'Dependency {0.id} raised {1!r}'
+                    .format(result, exc)
+                )
+                return EagerResult(task_id, chord_exc, state=states.FAILURE)
+
+            # fetch the GroupResult or error if propagate is True
+            try:
+                group_res = header_res.get(propagate=propagate)
+            except Exception as exc:
+                if eager_propagate:
+                    raise
+                return chord_error_result(header_res, exc)
+
+            # fetch the results list from GroupResult if we got one
+            if header_res.successful():
+                try:
+                    group_res = group_res.get(propagate=propagate)
+                except Exception as exc:
+                    if eager_propagate:
+                        raise
+                    return chord_error_result(group_res, exc)
+
+            # call the body with the group's result
+            return callback.apply(args=(group_res,))
+
     return Chord

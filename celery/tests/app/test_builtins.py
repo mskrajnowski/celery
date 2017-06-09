@@ -3,9 +3,10 @@ from __future__ import absolute_import
 from celery import group, chord
 from celery.app import builtins
 from celery.canvas import Signature
+from celery.exceptions import ChordError
 from celery.five import range
 from celery._state import _task_stack
-from celery.tests.case import AppCase, Mock, patch
+from celery.tests.case import ANY, AppCase, Mock, patch
 
 
 class BuiltinsCase(AppCase):
@@ -20,6 +21,11 @@ class BuiltinsCase(AppCase):
         def add(x, y):
             return x + y
         self.add = add
+
+        @self.app.task(shared=False)
+        def raising(*args):
+            raise KeyError('foo')
+        self.raising = raising
 
 
 class test_backend_cleanup(BuiltinsCase):
@@ -120,6 +126,35 @@ class test_group(BuiltinsCase):
         finally:
             _task_stack.pop()
 
+    def test_apply_without_CELERY_EAGER_PROPAGATES_EXCEPTIONS(self):
+        self.add.apply = Mock(wraps=self.add.apply)
+        self.raising.apply = Mock(wraps=self.raising.apply)
+        self.app.conf.CELERY_EAGER_PROPAGATES_EXCEPTIONS = False
+
+        g = group([self.add.s(1, 1), self.raising.s(), self.add.s(2, 2)])
+        res = g.apply()
+
+        self.assertEqual(self.add.apply.call_count, 2)
+        self.assertEqual(self.raising.apply.call_count, 1)
+
+        with self.assertRaises(KeyError):
+            res.get()
+
+        self.assertEqual(res.get(propagate=False), [2, ANY, 4])
+
+    def test_apply_with_CELERY_EAGER_PROPAGATES_EXCEPTIONS(self):
+        self.add.apply = Mock(wraps=self.add.apply)
+        self.raising.apply = Mock(wraps=self.raising.apply)
+        self.app.conf.CELERY_EAGER_PROPAGATES_EXCEPTIONS = True
+
+        g = group([self.add.s(1, 1), self.raising.s(), self.add.s(2, 2)])
+
+        with self.assertRaises(KeyError):
+            g.apply()
+
+        self.assertEqual(self.add.apply.call_count, 1)
+        self.assertEqual(self.raising.apply.call_count, 1)
+
 
 class test_chain(BuiltinsCase):
 
@@ -177,6 +212,35 @@ class test_chain(BuiltinsCase):
         for task in c.tasks:
             self.assertListEqual(task.options['link_error'], [s('error')])
 
+    def test_apply_without_CELERY_EAGER_PROPAGATES_EXCEPTIONS(self):
+        self.add.apply = Mock(wraps=self.add.apply)
+        self.raising.apply = Mock(wraps=self.raising.apply)
+        self.app.conf.CELERY_EAGER_PROPAGATES_EXCEPTIONS = False
+
+        c = self.add.s(1, 1) | self.raising.s() | self.add.s(2, 2)
+        res = c.apply()
+
+        self.assertEqual(self.add.apply.call_count, 1)
+        self.assertEqual(self.raising.apply.call_count, 1)
+
+        with self.assertRaises(KeyError):
+            res.get()
+
+        self.assertIsInstance(res.get(propagate=False), KeyError)
+
+    def test_apply_with_CELERY_EAGER_PROPAGATES_EXCEPTIONS(self):
+        self.add.apply = Mock(wraps=self.add.apply)
+        self.raising.apply = Mock(wraps=self.raising.apply)
+        self.app.conf.CELERY_EAGER_PROPAGATES_EXCEPTIONS = True
+
+        c = self.add.s(1, 1) | self.raising.s() | self.add.s(2, 2)
+
+        with self.assertRaises(KeyError):
+            c.apply()
+
+        self.assertEqual(self.add.apply.call_count, 1)
+        self.assertEqual(self.raising.apply.call_count, 1)
+
 
 class test_chord(BuiltinsCase):
 
@@ -215,3 +279,32 @@ class test_chord(BuiltinsCase):
         x = chord([self.add.s(i, i) for i in range(10)], body=self.xsum.s())
         r = x.apply_async()
         self.assertEqual(r.get(), 90)
+
+    def test_apply_without_CELERY_EAGER_PROPAGATES_EXCEPTIONS(self):
+        self.add.apply = Mock(wraps=self.add.apply)
+        self.raising.apply = Mock(wraps=self.raising.apply)
+        self.app.conf.CELERY_EAGER_PROPAGATES_EXCEPTIONS = False
+
+        c = chord([self.raising.s(), self.add.s(1, 1)], self.add.s([2]))
+        res = c.apply()
+
+        self.assertEqual(self.add.apply.call_count, 1)
+        self.assertEqual(self.raising.apply.call_count, 1)
+
+        with self.assertRaises(ChordError):
+            res.get()
+
+        self.assertIsInstance(res.get(propagate=False), ChordError)
+
+    def test_apply_with_CELERY_EAGER_PROPAGATES_EXCEPTIONS(self):
+        self.add.apply = Mock(wraps=self.add.apply)
+        self.raising.apply = Mock(wraps=self.raising.apply)
+        self.app.conf.CELERY_EAGER_PROPAGATES_EXCEPTIONS = True
+
+        c = chord([self.raising.s(), self.add.s(1, 1)], self.add.s([2]))
+
+        with self.assertRaises(KeyError):
+            c.apply()
+
+        self.assertEqual(self.add.apply.call_count, 0)
+        self.assertEqual(self.raising.apply.call_count, 1)
